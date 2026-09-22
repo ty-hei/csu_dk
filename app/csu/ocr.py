@@ -19,8 +19,8 @@ def _load():
         import ddddocr
 
         _engine = ddddocr.DdddOcr(show_ad=False)
-    except Exception as error:  # noqa: BLE001 - 没装、模型坏了都不能影响打卡主流程
-        print(f"[ocr] ddddocr 不可用（{error}），验证码只能人工处理", flush=True)
+    except Exception:  # noqa: BLE001 - 没装、模型坏了都不能影响打卡主流程
+        print("[ocr] ddddocr 不可用，请检查可选 OCR 依赖", flush=True)
         _engine = None
     return _engine
 
@@ -40,8 +40,8 @@ def solve(image: bytes) -> str | None:
         return None
     try:
         text = engine.classification(image)
-    except Exception as error:  # noqa: BLE001 - 识别失败按"没识别出来"处理
-        print(f"[ocr] 识别失败：{error}", flush=True)
+    except Exception:  # noqa: BLE001 - 识别失败按"没识别出来"处理
+        print("[ocr] 验证码识别失败", flush=True)
         return None
     cleaned = "".join(ch for ch in str(text or "") if ch.isalnum())
     if not MIN_LENGTH <= len(cleaned) <= MAX_LENGTH:

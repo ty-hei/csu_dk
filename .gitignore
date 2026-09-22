@@ -7,16 +7,23 @@ __pycache__/
 
 # 本地配置与数据
 .env
+.env.*
 /data/
+/.uv-cache/
+/.uv-python/
+/.uv-tools/
 *.db
 *.db-wal
 *.db-shm
 *.ses
 *.key
 *.pem
-
-# 工具
-.commandcode/
+*.sqlite
+*.sqlite3
+*.sqlite-*
+*cookies*.json
+*cookies*.txt
+/captcha-debug/
 
 # 系统
 .DS_Store

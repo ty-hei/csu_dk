@@ -5,18 +5,13 @@ import base64
 import re
 import secrets
 import time
-from collections.abc import Callable
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlsplit
 
 import requests
 from bs4 import BeautifulSoup
 from Crypto.Cipher import AES
 from Crypto.Util.Padding import pad
 
-from .. import config as cfg
-from ..errors import SecretDecryptError
-from ..log import log_event
-from ..permissions import harden_dir, harden_file
 from . import ocr
 
 CAS_BASE = "https://ca.csu.edu.cn/authserver"
@@ -97,12 +92,47 @@ def classify_error(text: str = "") -> str | None:
 
 
 def _is_cas_host(url: str) -> bool:
-    return url.startswith((CAS_BASE, "https://ca.csu.edu.cn/"))
+    parsed = urlsplit(url)
+    return parsed.scheme == "https" and parsed.netloc.lower() == "ca.csu.edu.cn"
 
 
-def cas_login(session: requests.Session, username: str, password: str | None,
-              service: str, timeout: int = 20,
-              before_password_login: Callable[[], None] | None = None) -> str:
+def _single_login_page(html: str) -> bool:
+    soup = BeautifulSoup(html, "html.parser")
+    return all(
+        soup.select_one(f'form#{event} input[name="_eventId"][value="{event}"]') is not None
+        for event in ("continue", "cancel")
+    ) or "单处登录" in html or "当前账户已在其他PC端登录" in html
+
+
+def _continue_single_login(session: requests.Session, response, timeout: int, *, force_logout: bool):
+    """按学校官方 continue 表单登出其他 PC；每次登录至多提交一次。"""
+    if not _is_cas_host(response.url) or not _single_login_page(response.text):
+        return response
+    if not force_logout:
+        raise RuntimeError("当前账户已在其他 PC 端登录，可勾选「登出其他 PC 并继续」后重试")
+    form = BeautifulSoup(response.text, "html.parser").select_one("form#continue")
+    if form is None or str(form.get("method", "")).lower() != "post":
+        raise RuntimeError("学校单处登录表单结构异常，未执行强制登出")
+    target = urljoin(response.url, str(form.get("action") or response.url))
+    if not _is_cas_host(target) or not urlsplit(target).path.startswith("/authserver/"):
+        raise RuntimeError("学校单处登录表单地址异常，未执行强制登出")
+    fields = {}
+    for name in ("execution", "_eventId"):
+        inputs = form.select(f'input[name="{name}"]')
+        if len(inputs) != 1 or not inputs[0].get("value"):
+            raise RuntimeError("学校单处登录表单字段异常，未执行强制登出")
+        fields[name] = str(inputs[0]["value"])
+    if fields["_eventId"] != "continue":
+        raise RuntimeError("学校单处登录表单事件异常，未执行强制登出")
+    result = session.post(target, data=fields, headers={"user-agent": UA, "referer": response.url}, timeout=timeout)
+    result.raise_for_status()
+    if _is_cas_host(result.url) and _single_login_page(result.text):
+        raise RuntimeError("学校单处登录限制尚未解除，请在学校页面核实后重试")
+    return result
+
+
+def cas_login(session: requests.Session, username: str, password: str,
+              service: str, timeout: int = 20, *, force_logout: bool = False) -> str:
     """登录 CAS 并返回落地页。"""
     login_url = f"{CAS_BASE}/login?service={requests.utils.quote(service, safe='')}"
 
@@ -111,22 +141,22 @@ def cas_login(session: requests.Session, username: str, password: str | None,
     if frozen:
         raise frozen
 
+    first = _continue_single_login(session, first, timeout, force_logout=force_logout)
+
     if not _is_cas_host(first.url):
         return first.text
 
     if not input_value(first.text, "execution") or not input_value(first.text, "pwdEncryptSalt"):
         raise RuntimeError("未找到 CAS 登录表单（页面结构可能变了）")
 
-    if password is None:
-        raise SecretDecryptError("CAS 会话已失效，而本地保存的密码又无法解密，请在「编辑账号」里重新提交一次密码")
-
-    if before_password_login:
-        before_password_login()
+    if not password:
+        raise RuntimeError("请填写密码")
 
     if _needs_captcha(session, username, timeout):
-        return _login_with_captcha(session, login_url, username, password, timeout)
+        return _login_with_captcha(session, login_url, username, password, timeout,
+                                   force_logout=force_logout)
 
-    return _submit_login(session, login_url, first.text, username, password, "", timeout)
+    return _submit_login(session, login_url, first.text, username, password, "", timeout, force_logout=force_logout)
 
 
 def _needs_captcha(session: requests.Session, username: str, timeout: int) -> bool:
@@ -148,7 +178,7 @@ def _looks_like_image(data: bytes) -> bool:
 
 
 def _captcha_image(session: requests.Session, page_html: str, login_url: str,
-                   timeout: int) -> tuple[bytes | None, str, str]:
+                   timeout: int) -> bytes | None:
     """读取验证码图片。"""
     src = None
     for tag in BeautifulSoup(page_html, "html.parser").find_all("img"):
@@ -156,71 +186,48 @@ def _captcha_image(session: requests.Session, page_html: str, login_url: str,
         if "captcha" in candidate.lower():
             src = urljoin(login_url, candidate)
             break
-    source = "page" if src else "fallback"
     url = src or f"{CAPTCHA_URL}?{int(time.time() * 1000)}"
 
     try:
         response = session.get(url, headers={"user-agent": UA, "referer": login_url}, timeout=timeout)
-    except requests.RequestException as error:
-        log_event("checkin.captcha_image_failed", source=source, url=url, error=str(error))
-        return None, source, url
+    except requests.RequestException:
+        return None
 
     if not response.ok or not _looks_like_image(response.content):
-        log_event("checkin.captcha_image_failed", source=source, url=url,
-                  status=response.status_code, bytes=len(response.content or b""))
-        return None, source, url
-    return response.content, source, url
-
-
-def _keep_evidence(page_html: str, image: bytes | None) -> None:
-    """保存验证码诊断材料。"""
-    try:
-        directory = cfg.DATA_DIR / "captcha-debug"
-        directory.mkdir(parents=True, exist_ok=True)
-        harden_dir(directory)
-        page_file = directory / "last-login-page.html"
-        page_file.write_text(page_html, encoding="utf-8")
-        harden_file(page_file)
-        if image:
-            image_file = directory / "last-captcha.png"
-            image_file.write_bytes(image)
-            harden_file(image_file)
-    except OSError as error:
-        print(f"[cas] 现场证据保存失败（不影响登录）：{error}", flush=True)
+        return None
+    return response.content
 
 
 def _login_with_captcha(session: requests.Session, login_url: str, username: str,
-                        password: str, timeout: int) -> str:
-    for attempt in range(1, MAX_CAPTCHA_ATTEMPTS + 1):
+                        password: str, timeout: int, *, force_logout: bool = False) -> str:
+    for _attempt in range(MAX_CAPTCHA_ATTEMPTS):
         page = session.get(login_url, headers={"user-agent": UA}, timeout=timeout)
         frozen = detect_ip_frozen(page.text)
         if frozen:
             raise frozen
 
-        image, source, url = _captcha_image(session, page.text, login_url, timeout)
-        _keep_evidence(page.text, image)
+        image = _captcha_image(session, page.text, login_url, timeout)
         code = ocr.solve(image) if image else None
-        log_event("checkin.captcha_attempt", attempt=attempt, source=source, url=url,
-                  bytes=len(image or b""), recognized=bool(code), recognized_length=len(code or ""))
         if not code:
             # 不提交无效识别结果
             raise RuntimeError(
                 "CAS 要求输入验证码，但自动识别不可用（未安装 ddddocr 或识别失败），"
-                "请先在浏览器登录一次后再试"
+                "请启用 OCR 支持或稍后重试"
             )
 
         try:
-            return _submit_login(session, login_url, page.text, username, password, code, timeout)
+            return _submit_login(session, login_url, page.text, username, password, code, timeout,
+                                 force_logout=force_logout)
         except _CaptchaRejected:
             continue
 
     raise RuntimeError(
-        f"CAS 验证码连续 {MAX_CAPTCHA_ATTEMPTS} 次未通过，请先在浏览器登录一次后再试"
+        f"CAS 验证码连续 {MAX_CAPTCHA_ATTEMPTS} 次未通过，请启用 OCR 支持或稍后重试"
     )
 
 
 def _submit_login(session: requests.Session, login_url: str, page_html: str, username: str,
-                  password: str, captcha: str, timeout: int) -> str:
+                  password: str, captcha: str, timeout: int, *, force_logout: bool = False) -> str:
     execution = input_value(page_html, "execution")
     salt = input_value(page_html, "pwdEncryptSalt")
     if not execution or not salt:
@@ -244,6 +251,7 @@ def _submit_login(session: requests.Session, login_url: str, page_html: str, use
         timeout=timeout,
     )
 
+    posted = _continue_single_login(session, posted, timeout, force_logout=force_logout)
     frozen_after = detect_ip_frozen(posted.text)
     if frozen_after:
         raise frozen_after
@@ -252,21 +260,19 @@ def _submit_login(session: requests.Session, login_url: str, page_html: str, use
     if tip:
         kind = classify_error(tip)
         if kind == "captcha":
-            raise _CaptchaRejected(tip)
+            raise _CaptchaRejected("验证码未通过")
         if kind == "badCredentials":
             raise RuntimeError(
                 "学号或密码有误。请先前往学校信息门户确认能够正常登录，"
-                "再回到此页面添加账号"
+                "再回到本地页面重试"
             )
         if kind == "inactive":
             raise RuntimeError("账号未激活，请先在统一身份认证平台激活")
         if kind == "locked":
             raise RuntimeError("账号已被锁定，请联系学校")
-        raise RuntimeError(f"CAS 登录失败：{tip}")
+        raise RuntimeError("CAS 登录失败，请在学校页面查看原因")
 
     if _is_cas_host(posted.url):
-        text = re.sub(r"<script[\s\S]*?</script>", " ", posted.text, flags=re.IGNORECASE)
-        snippet = re.sub(r"\s+", " ", re.sub(r"<[^>]*>", " ", text))
-        raise RuntimeError(f"CAS 登录未完成（仍停留在登录页）：{snippet.strip()[:160]}")
+        raise RuntimeError("CAS 登录未完成，仍停留在学校认证页面")
 
     return posted.text

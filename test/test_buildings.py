@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import math
-import random
 
 import pytest
 
@@ -43,37 +42,6 @@ class TestSeed:
         assert buildings.resolve("") is None
 
 
-class TestCacheable:
-    @pytest.mark.parametrize("name", ["升华24栋", "3舍-1", "桃B-2", "湘雅B栋", "研北1"])
-    def test_楼栋名可以缓存(self, name):
-        assert buildings.cacheable(name)
-
-    @pytest.mark.parametrize("name", ["你申报的租房地址", "校外实习地址", "住宿地址不详", ""])
-    def test_公用标签不缓存(self, name):
-        assert not buildings.cacheable(name)
-
-
-class TestLearn:
-    def test_测到的楼栋会被记下来(self):
-        assert buildings.resolve("升华2栋") is None
-        buildings.learn("升华2栋", (112.9361, 28.1571))
-        assert buildings.resolve("升华2栋") == (112.9361, 28.1571)
-
-    def test_公用标签不会被写进缓存(self):
-        buildings.learn("你申报的租房地址", (112.9, 28.1))
-        assert buildings.resolve("你申报的租房地址") is None
-
-    def test_写坏的文件当空处理(self):
-        buildings._learned_path().write_text("{ 不是 json", encoding="utf-8")
-        buildings.reload()
-        assert buildings.resolve("升华8栋")
-        assert buildings.resolve("升华2栋") is None
-
-    def test_学到的优先于种子(self):
-        buildings.learn("升华8栋", (112.9, 28.1))
-        assert buildings.resolve("升华8栋") == (112.9, 28.1)
-
-
 class TestGeometry:
     def test_平移与反算互逆(self):
         point = (112.936833, 28.157238)
@@ -92,31 +60,6 @@ class TestGeometry:
                                   3000 * math.cos(math.radians(b))) for b in (0, 120, 240)]
         dists = [round(buildings.distance(p, target)) for p in points]
         assert haversine(buildings._solve(points, dists), target) < 2.0
-
-
-class TestScatter:
-    CENTER = (112.936833, 28.157238)
-
-    def test_points_stay_within_radius(self):
-        rng = random.Random(20260918)
-        offsets = [buildings.distance(self.CENTER, buildings.scatter(self.CENTER, 50.0, rng))
-                   for _ in range(500)]
-        assert all(0.0 <= offset <= 50.0 for offset in offsets)
-
-    def test_nonpositive_radius_returns_center(self):
-        assert buildings.scatter(self.CENTER, 0) == self.CENTER
-        assert buildings.scatter(self.CENTER, -1.0) == self.CENTER
-
-    def test_points_are_random(self):
-        assert len({buildings.scatter(self.CENTER, 50.0) for _ in range(20)}) > 1
-
-    def test_points_are_area_uniform(self):
-        rng = random.Random(7)
-        offsets = [buildings.distance(self.CENTER, buildings.scatter(self.CENTER, 100.0, rng))
-                   for _ in range(2000)]
-        inner = sum(1 for offset in offsets if offset < 50.0) / len(offsets)
-        assert 0.20 < inner < 0.30
-        assert max(offsets) > 90.0
 
 
 class TestLocate:
@@ -152,18 +95,18 @@ class TestForStudent:
     def test_缓存命中只花两次查询(self):
         school = FakeSchool((112.936833, 28.157238), name="升华8栋")
         coord, name, verdict, source = buildings.for_student(school)
-        assert (source, name) == ("cache", "升华8栋")
+        assert (source, name) == ("seed", "升华8栋")
         assert coord == buildings.resolve("升华8栋")
         assert verdict["canDk"]
         assert school.calls == 2
 
-    def test_没测过的楼栋测一次并记住(self):
+    def test_未知楼栋测定但不持久化(self):
         school = FakeSchool((112.936292, 28.156628), name="升华2栋")
         assert buildings.resolve("升华2栋") is None
         coord, name, _, source = buildings.for_student(school)
         assert (source, name) == ("located", "升华2栋")
         assert haversine(coord, (112.936292, 28.156628)) < 5.0
-        assert buildings.resolve("升华2栋") == coord
+        assert buildings.resolve("升华2栋") is None
 
     def test_缓存点学校不认就改走探点(self):
         school = FakeSchool((112.936292, 28.156628), name="升华8栋", can_dk=False)
@@ -177,4 +120,3 @@ class TestForStudent:
         assert (source, name) == ("located", "你申报的租房地址")
         assert haversine(coord, (112.927056, 28.175114)) < 5.0
         assert buildings.resolve("你申报的租房地址") is None
-        assert "你申报的租房地址" not in buildings._learned()

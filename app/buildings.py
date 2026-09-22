@@ -1,15 +1,12 @@
-"""楼栋坐标缓存与探点定位。"""
+"""楼栋种子坐标与探点定位；不写入个人地址或运行时缓存。"""
 from __future__ import annotations
 
 import json
 import math
-import random
 from functools import lru_cache
 from pathlib import Path
 
-from . import config as cfg
 from .errors import UpstreamError
-from .log import log_event
 
 SEED_PATH = Path(__file__).with_name("data") / "buildings.json"
 
@@ -19,8 +16,6 @@ PROBE_RADIUS_RATIO = 0.05
 PROBE_BEARINGS = (0.0, 120.0, 240.0)
 LOCATE_ATTEMPTS = 3
 VERIFY_MAX_M = 50.0
-LABEL_HINTS = ("租房", "申报", "地址", "你", "我")
-MAX_NAME_LEN = 12
 
 _R = 6371000.0
 _DEG = math.pi / 180.0
@@ -35,26 +30,11 @@ def shift(point: tuple[float, float], east: float, north: float) -> tuple[float,
     return (point[0] + east / _deg_lon_m(point[1]), point[1] + north / _DEG_LAT_M)
 
 
-def scatter(point: tuple[float, float], radius_m: float,
-            rng: random.Random | None = None) -> tuple[float, float]:
-    """在圆盘内按面积均匀取点，避免采样向圆心聚集。"""
-    if radius_m <= 0:
-        return point
-    rng = rng or random
-    distance_m = radius_m * math.sqrt(rng.random())
-    bearing = rng.uniform(0.0, 2 * math.pi)
-    return shift(point, distance_m * math.sin(bearing), distance_m * math.cos(bearing))
-
-
 def distance(a: tuple[float, float], b: tuple[float, float]) -> float:
     lat1, lat2 = math.radians(a[1]), math.radians(b[1])
     h = (math.sin((lat2 - lat1) / 2) ** 2
          + math.cos(lat1) * math.cos(lat2) * math.sin(math.radians(b[0] - a[0]) / 2) ** 2)
     return 2 * _R * math.asin(min(1.0, math.sqrt(h)))
-
-
-def _learned_path() -> Path:
-    return cfg.config.data_dir / "buildings.learned.json"
 
 
 def _read(path: Path) -> dict:
@@ -83,59 +63,15 @@ def _seed() -> dict:
     return data
 
 
-@lru_cache(maxsize=1)
-def _learned() -> dict:
-    return _read(_learned_path())
-
-
-def reload() -> None:
-    _seed.cache_clear()
-    _learned.cache_clear()
-
-
 def base() -> tuple[float, float]:
     return _coord(_seed().get("base")) or DEFAULT_BASE
-
-
-def names() -> list[str]:
-    return sorted(set(_seed()["points"]) | set(_learned()))
 
 
 def resolve(school_name: str) -> tuple[float, float] | None:
     name = (school_name or "").strip()
     if not name:
         return None
-    return _coord(_learned().get(name)) or _coord(_seed()["points"].get(name))
-
-
-def cacheable(school_name: str) -> bool:
-    """排除不能跨账号复用的通用地址标签。"""
-    name = (school_name or "").strip()
-    if not name or len(name) > MAX_NAME_LEN:
-        return False
-    return not any(hint in name for hint in LABEL_HINTS)
-
-
-def learn(school_name: str, coord: tuple[float, float]) -> None:
-    """原子更新运行时缓存。"""
-    name = (school_name or "").strip()
-    if not cacheable(name):
-        return
-    learned = _learned()
-    previous = _coord(learned.get(name))
-    learned[name] = [coord[0], coord[1]]
-    path = _learned_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(learned, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
-                   encoding="utf-8")
-    tmp.replace(path)
-    _learned.cache_clear()
-    if previous and distance(previous, coord) > 1000:
-        log_event("building.relocated", level="warning", building=name,
-                  previous=f"{previous[0]:.6f},{previous[1]:.6f}",
-                  current=f"{coord[0]:.6f},{coord[1]:.6f}",
-                  distance_m=round(distance(previous, coord)))
+    return _coord(_seed()["points"].get(name))
 
 
 def check(client, point: tuple[float, float]) -> dict:
@@ -226,7 +162,6 @@ def for_student(client, name: str = "") -> tuple[tuple[float, float], str, dict,
     if cached is not None:
         verdict = check(client, cached)
         if verdict.get("canDk"):
-            return cached, school_name, verdict, "cache"
+            return cached, school_name, verdict, "seed"
     coord, measured = locate(client, base())
-    learn(measured or school_name, coord)
     return coord, measured or school_name, check(client, coord), "located"

@@ -1,15 +1,11 @@
 """智慧学工（zhxg.csu.edu.cn）：CAS 登录换业务 JWT，业务请求体走 DES-ECB。"""
 from __future__ import annotations
 
-import http.cookiejar
-import json
 import re
-from collections.abc import Callable
 from urllib.parse import quote
 
 import requests
 
-from .. import exits
 from .cas import UA, cas_login
 from .des import des_encrypt, generate_casual
 
@@ -24,94 +20,19 @@ class ZhxgError(Exception):
     pass
 
 
-def dump_cookies(session: requests.Session) -> str:
-    return json.dumps([
-        {
-            "name": cookie.name,
-            "value": cookie.value,
-            "domain": cookie.domain,
-            "path": cookie.path or "/",
-            "secure": bool(cookie.secure),
-            "expires": cookie.expires,
-        }
-        for cookie in session.cookies
-    ])
-
-
-def load_cookies(session: requests.Session, raw: str | None) -> None:
-    """忽略无效 Cookie 数据。"""
-    if not raw:
-        return
-    try:
-        items = json.loads(raw)
-    except ValueError:
-        return
-    if not isinstance(items, list):
-        return
-    for item in items:
-        if not isinstance(item, dict) or not item.get("name"):
-            continue
-        domain = str(item.get("domain") or "")
-        session.cookies.set_cookie(http.cookiejar.Cookie(
-            version=0,
-            name=str(item["name"]),
-            value=str(item.get("value") or ""),
-            port=None,
-            port_specified=False,
-            domain=domain,
-            domain_specified=bool(domain),
-            domain_initial_dot=domain.startswith("."),
-            path=str(item.get("path") or "/"),
-            path_specified=True,
-            secure=bool(item.get("secure")),
-            expires=item.get("expires"),
-            discard=item.get("expires") is None,
-            comment=None,
-            comment_url=None,
-            rest={},
-            rfc2109=False,
-        ))
-
-
-def new_session(proxy: str | None = None) -> requests.Session:
-    session = requests.Session()
-    if proxy is None:
-        proxy = exits.current()
-    session.csu_exit = proxy
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
-    return session
+def new_session() -> requests.Session:
+    return requests.Session()
 
 
 class ZhxgClient:
-    def __init__(self, session: requests.Session | None = None, casual: str | None = None,
-                 token: str | None = None, cookies: str | None = None):
-        self.session = session or new_session()
-        self.exit = self.session.csu_exit if hasattr(self.session, "csu_exit") else exits.current()
-        if cookies:
-            load_cookies(self.session, cookies)
-        self.casual = casual or generate_casual(16)
-        self.token = token or None
+    def __init__(self, session: requests.Session | None = None, *, force_logout: bool = False):
+        self.session = session if session is not None else new_session()
+        self.force_logout = force_logout
+        self.casual = generate_casual(16)
+        self.token = None
 
-    def cookies_json(self) -> str:
-        """把会话 cookie 序列化落库（与密码同等待遇，加密存储）。"""
-        return dump_cookies(self.session)
-
-    def has_login_cookie(self) -> bool:
-        """是否持有可用于免密登录 CAS 的 Cookie。"""
-        return any(cookie.name.upper() == "CASTGC" for cookie in self.session.cookies)
-
-    def switch_exit(self, proxy: str | None = None) -> None:
-        """保留 Cookie，并用当前可用出口重建网络会话。"""
-        cookies = self.cookies_json()
-        self.session = new_session(proxy)
-        load_cookies(self.session, cookies)
-        self.exit = self.session.csu_exit
-
-    def login(self, username: str, password: str | None = None,
-              before_password_login: Callable[[], None] | None = None) -> str:
-        html = cas_login(self.session, username, password, CAS_CALLBACK,
-                         before_password_login=before_password_login)
+    def login(self, username: str, password: str) -> str:
+        html = cas_login(self.session, username, password, CAS_CALLBACK, force_logout=self.force_logout)
         return self._exchange_callback(html)
 
     def _exchange_callback(self, html: str) -> str:
@@ -140,9 +61,10 @@ class ZhxgClient:
             data = response.json()
         except ValueError:
             data = {}
-        token = (data.get("data") or {}).get("token")
+        payload = data.get("data") if isinstance(data, dict) else None
+        token = payload.get("token") if isinstance(payload, dict) else None
         if not token:
-            raise ZhxgError(f"换取业务 token 失败：{json.dumps(data, ensure_ascii=False)[:200]}")
+            raise ZhxgError("换取业务 token 失败，请在学校页面确认账号状态")
         self.token = token
         return token
 
@@ -164,9 +86,12 @@ class ZhxgClient:
             timeout=20,
         )
         try:
-            return response.json()
+            result = response.json()
         except ValueError:
-            return {"code": f"HTTP {response.status_code}", "message": response.text[:200], "data": None}
+            result = None
+        if not isinstance(result, dict):
+            raise ZhxgError("学校接口返回格式异常")
+        return result
 
     def dk_status(self, dklb: str = "PA") -> dict:
         return self.post("/qxj-padkglxx/queryKqDkbc", {"paramsData": {"dklb": dklb}})
@@ -179,6 +104,3 @@ class ZhxgClient:
         return self.post("/qxj-padkglxx/xspadk", {
             "jd": jd, "wd": wd, "dkbc": dkbc, "dkdz": dkdz, "smsy": smsy, "smfj": smfj, "sfwcdk": sfwcdk,
         })
-
-    def month_stats(self, rq: str, dklb: str = "PA") -> dict:
-        return self.post("/qxj-padkglxx/queryPadkKqAyListByXh", {"paramsData": {"rq": rq, "dklb": dklb}})
